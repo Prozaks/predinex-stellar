@@ -905,6 +905,33 @@ pub struct UserPoolPosition {
     pub total_bet: i128,
 }
 
+/// #1056 — Batched snapshot returned by `get_user_portfolio`.
+///
+/// Combines the user's bet position, LP stake, pending LP rewards, and claim
+/// status for a single pool into one struct so dashboard screens can retrieve
+/// all per-pool data with a single contract call instead of N fan-out reads.
+///
+/// Fields
+/// ------
+/// - `pool_id`          – pool identifier
+/// - `amount_a`         – user's stake on outcome A (raw units / stroops)
+/// - `amount_b`         – user's stake on outcome B (raw units / stroops)
+/// - `total_bet`        – total tokens staked by the user (`amount_a + amount_b`)
+/// - `lp_shares`        – LP shares held by the user in this pool; 0 if none
+/// - `pending_rewards`  – accrued but unclaimed LP rewards in raw token units
+/// - `claim_status`     – whether the user can claim winnings / a refund
+#[derive(Clone)]
+#[contracttype]
+pub struct UserPoolSnapshot {
+    pub pool_id: u32,
+    pub amount_a: i128,
+    pub amount_b: i128,
+    pub total_bet: i128,
+    pub lp_shares: i128,
+    pub pending_rewards: i128,
+    pub claim_status: ClaimStatus,
+}
+
 /// #159 — Result type returned by `preview_claimable_amount`.
 ///
 /// Variants
@@ -7370,16 +7397,10 @@ impl PredinexContract {
             }
             let key = DataKey::UserBet(pool_id, user.clone());
             if let Some(bet) = env.storage().persistent().get::<_, UserBet>(&key) {
-                // #1053 — Only extend TTL if remaining lifetime is below threshold.
-                // This avoids metered write amplification from dashboard polling; reads
-                // now trigger writes only when the entry is approaching expiration.
-                if let Some(remaining_ttl) = env.storage().persistent().get_ttl(&key) {
-                    if remaining_ttl < POOL_BUMP_THRESHOLD {
-                        env.storage()
-                            .persistent()
-                            .extend_ttl(&key, POOL_BUMP_THRESHOLD, POOL_BUMP_TARGET);
-                    }
-                }
+                // #1053 — Extend TTL on read to keep user positions alive.
+                env.storage()
+                    .persistent()
+                    .extend_ttl(&key, POOL_BUMP_THRESHOLD, POOL_BUMP_TARGET);
                 result.push_back(UserPoolPosition {
                     pool_id,
                     amount_a: bet.amount_a,
@@ -7387,6 +7408,104 @@ impl PredinexContract {
                     total_bet: bet.total_bet,
                 });
             }
+        }
+
+        result
+    }
+
+    /// #1056 — Batched portfolio query: returns one `UserPoolSnapshot` per pool
+    /// where the user has an active bet position, an LP stake, or both.
+    ///
+    /// This replaces the N individual `get_user_bet` + `get_lp_position` +
+    /// `get_pending_lp_rewards` + `get_claim_status` fan-out calls that the
+    /// dashboard previously issued.  All data for up to `count` pools (capped
+    /// at 50) starting from `start_id` is returned in a single invocation.
+    ///
+    /// Pools where the user has neither a bet nor an LP position are skipped,
+    /// so the returned `Vec` may contain fewer entries than `count`.
+    ///
+    /// # Arguments
+    /// - `user`     – the account whose positions are being queried
+    /// - `start_id` – first pool ID to inspect (inclusive)
+    /// - `count`    – maximum number of pool IDs to scan (capped at 50)
+    pub fn get_user_portfolio(
+        env: Env,
+        user: Address,
+        start_id: u32,
+        count: u32,
+    ) -> Vec<UserPoolSnapshot> {
+        let mut result = Vec::new(&env);
+        let pool_count = Self::get_pool_count(env.clone());
+
+        if start_id > pool_count {
+            return result;
+        }
+
+        // Cap at 50 to bound read-budget consumption.
+        let effective_count = if count > 50 { 50 } else { count };
+
+        for i in 0..effective_count {
+            let pool_id = start_id + i;
+            if pool_id > pool_count {
+                break;
+            }
+
+            let bet_key = DataKey::UserBet(pool_id, user.clone());
+            let maybe_bet: Option<UserBet> =
+                env.storage().persistent().get::<_, UserBet>(&bet_key);
+
+            let lp_position: LpPosition = env
+                .storage()
+                .persistent()
+                .get(&DataKey::LpPosition(pool_id, user.clone()))
+                .unwrap_or(LpPosition {
+                    shares: 0,
+                    reward_debt: 0,
+                });
+
+            // Skip pools where the user has neither a bet nor an LP stake.
+            if maybe_bet.is_none() && lp_position.shares == 0 {
+                continue;
+            }
+
+            let (amount_a, amount_b, total_bet) = match &maybe_bet {
+                Some(b) => (b.amount_a, b.amount_b, b.total_bet),
+                None => (0, 0, 0),
+            };
+
+            // Pending LP rewards (mirrors get_pending_lp_rewards logic).
+            let pending_rewards = if lp_position.shares > 0 {
+                let fee_per_share: i128 = env
+                    .storage()
+                    .persistent()
+                    .get(&DataKey::LpFeePerShare(pool_id))
+                    .unwrap_or(0);
+                let raw = Self::pending_lp_rewards(
+                    &env,
+                    pool_id,
+                    &user,
+                    &lp_position,
+                    fee_per_share,
+                )
+                .unwrap_or((0, 0))
+                .0;
+                if raw < 0 { 0 } else { raw }
+            } else {
+                0
+            };
+
+            // Claim status (mirrors get_claim_status logic).
+            let claim_status = Self::get_claim_status(env.clone(), pool_id, user.clone());
+
+            result.push_back(UserPoolSnapshot {
+                pool_id,
+                amount_a,
+                amount_b,
+                total_bet,
+                lp_shares: lp_position.shares,
+                pending_rewards,
+                claim_status,
+            });
         }
 
         result
@@ -7929,8 +8048,10 @@ impl PredinexContract {
         if url.len() < 10 {
             return Err(ContractError::InvalidWebhookUrl);
         }
-        let url_bytes = url.to_string();
-        let after_scheme = &url_bytes.as_bytes()[8..]; // skip "https://"
+        let url_len = url.len() as usize;
+        let mut url_raw = vec![0u8; url_len];
+        url.copy_into_slice(&mut url_raw);
+        let after_scheme = &url_raw[8..]; // skip "https://"
         if after_scheme.is_empty() || after_scheme[0] == b':' || after_scheme[0] == b'/' {
             return Err(ContractError::InvalidWebhookUrl);
         }
@@ -9296,7 +9417,8 @@ impl PredinexContract {
         
         // Reject any outcome index >= num_outcomes to prevent settling to an
         // out-of-bounds outcome that would break payout calculations.
-        if winning_outcome >= source_pool.num_outcomes {
+        let source_outcomes = Self::read_outcomes(&env, source_pool_id, &source_pool);
+        if winning_outcome >= source_outcomes.len() {
             return Err(ContractError::InvalidOutcome);
         }
         
@@ -9936,7 +10058,7 @@ impl PredinexContract {
         let position: LpPosition = env
             .storage()
             .persistent()
-            .get(&DataKey::LpPosition(pool_id, user))
+            .get(&DataKey::LpPosition(pool_id, user.clone()))
             .unwrap_or(LpPosition {
                 shares: 0,
                 reward_debt: 0,
