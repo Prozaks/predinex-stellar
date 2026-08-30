@@ -376,6 +376,31 @@ npm test -- --run --reporter=verbose
 
 ---
 
+## Bot Secret Rotation (Operator & Webhooks)
+
+When operating the Predinex Settlement Bot (`bot/` directory) in production, you may occasionally need to rotate secrets for security compliance or in response to a suspected compromise. 
+
+### Webhook Secrets (`WEBHOOK_SECRET`)
+
+The webhook secret is used to sign outgoing JSON payloads (via HMAC-SHA256). To rotate this secret without dropping events:
+
+1. **Generate a new secret**: (must be at least 16 characters) `openssl rand -hex 32`
+2. **Update receiving servers**: Configure your webhook ingestion endpoints to accept payloads signed by EITHER the old secret or the new secret during the transition window.
+3. **Update bot configuration**: Change `WEBHOOK_SECRET` in your bot's environment variables and restart the bot.
+4. **Remove old secret**: Once the bot is successfully running with the new secret, drop support for the old secret from your receiving servers.
+
+### Operator Keys (`BOT_SECRET_KEY`)
+
+The `BOT_SECRET_KEY` is a Stellar secret key (starting with `S`) used to sign settlement transactions on behalf of the bot. 
+
+1. **Generate a new keypair**: You can use Stellar Lab or the Stellar CLI to generate a new keypair.
+2. **Fund the new account**: Transfer sufficient XLM from the old bot account (or another funding source) to the new public key so it can cover transaction fees.
+3. **Update bot configuration**: Change `BOT_SECRET_KEY` in the bot's environment variables to the new secret key.
+4. **Restart the bot**: The bot will immediately begin using the new key to sign transactions. 
+5. **Drain old account**: (Optional) Transfer any remaining XLM dust from the compromised/old bot wallet to your cold storage or the new bot wallet.
+
+---
+
 ## First Steps After Setup
 
 ### 1. Explore the Structure
