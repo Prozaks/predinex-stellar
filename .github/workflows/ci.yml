@@ -165,6 +165,10 @@ jobs:
         working-directory: .
         run: bash scripts/lint-deploy-docs.sh
 
+      - name: Lint Contract API Docs
+        working-directory: .
+        run: python3 scripts/lint-contract-api.py
+
       - name: Measure current contract WASM size
         id: wasm_size_head
         working-directory: .
