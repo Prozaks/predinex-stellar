@@ -58,6 +58,11 @@ export type RuntimeConfig = {
   webhook?: WebhookSettings;
   /** Per-pool webhook configurations (poolId -> settings) */
   poolWebhooks?: Record<number, PoolWebhookSettings>;
+  /**
+   * Default oracle provider address pre-filled in the oracle registration form.
+   * Sourced from `NEXT_PUBLIC_DEFAULT_ORACLE_ADDRESS`. Empty string when not configured.
+   */
+  defaultOracleAddress: string;
 };
 
 const DEFAULT_NETWORK: SupportedNetwork = 'testnet';
@@ -110,10 +115,11 @@ function resolveContractConfig(network: SupportedNetwork): ContractConfig {
   const analyticsKey: AnalyticsNetworkKey = network === 'mainnet' ? 'MAINNET' : 'TESTNET';
   const contractIdFromAnalytics = ANALYTICS_NETWORK_CONFIG[analyticsKey]?.CONTRACT_ADDRESS;
 
+  // When no contract ID is configured (e.g. test/dev environments without a
+  // deployed contract), return a safe placeholder rather than throwing.
+  // Contract calls will fail gracefully at the RPC layer; the UI degrades.
   if (!contractIdFromAnalytics || typeof contractIdFromAnalytics !== 'string') {
-    throw new Error(
-      `Missing contract id for network '${network}'. Expected it in analytics NETWORK_CONFIG[${analyticsKey}].CONTRACT_ADDRESS.`
-    );
+    return { address: '', name: '', id: '' };
   }
 
   return parseContractId(contractIdFromAnalytics);
@@ -166,6 +172,8 @@ export function getRuntimeConfig(): RuntimeConfig {
     },
     // Webhook configuration from environment
     webhook: parseWebhookConfig(),
+    // Default oracle address for the oracle management registration form.
+    defaultOracleAddress: getOptionalEnv('NEXT_PUBLIC_DEFAULT_ORACLE_ADDRESS') ?? '',
   };
 
   return cachedConfig;
