@@ -161,6 +161,10 @@ jobs:
       - name: Run tests
         run: cargo test
 
+      - name: Lint deployment docs
+        working-directory: .
+        run: bash scripts/lint-deploy-docs.sh
+
       - name: Measure current contract WASM size
         id: wasm_size_head
         working-directory: .
