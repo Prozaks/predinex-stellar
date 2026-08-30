@@ -70,9 +70,8 @@ impl<'a> ConcurrentTestEnv<'a> {
 
         // Generate user addresses (separate from creator)
         let creator = Address::generate(&env);
-        let users: alloc::vec::Vec<Address> = (0..num_users)
-            .map(|_| Address::generate(&env))
-            .collect();
+        let users: alloc::vec::Vec<Address> =
+            (0..num_users).map(|_| Address::generate(&env)).collect();
 
         ConcurrentTestEnv {
             env,
@@ -281,13 +280,8 @@ fn c4_concurrent_bets_with_referrals() {
 
     // All users bet with the same referrer
     for user in test.users.iter().skip(1) {
-        test.client.place_bet(
-            user,
-            &pool_id,
-            &0u32,
-            &bet_amount,
-            &Some(referrer.clone()),
-        );
+        test.client
+            .place_bet(user, &pool_id, &0u32, &bet_amount, &Some(referrer.clone()));
     }
 
     let pool = test.client.get_pool(&pool_id).unwrap();
@@ -370,8 +364,7 @@ fn c6_concurrent_claims_after_settlement() {
         .users
         .iter()
         .map(|user| {
-            let token_client =
-                soroban_sdk::token::TokenClient::new(&test.env, &test.token);
+            let token_client = soroban_sdk::token::TokenClient::new(&test.env, &test.token);
             token_client.balance(user)
         })
         .collect();
@@ -608,7 +601,10 @@ fn c11_concurrent_mixed_operations() {
     // Calculate expected: first half has 0.5x bet, second half has 2x bet
     let expected = (bet_amount / 2) * half_users as i128 + (bet_amount * 2) * half_users as i128;
 
-    assert_eq!(pool.total_a, expected, "Pool total must reflect all operations");
+    assert_eq!(
+        pool.total_a, expected,
+        "Pool total must reflect all operations"
+    );
 }
 
 /// C12: Concurrent participant count accuracy
@@ -638,8 +634,7 @@ fn c12_concurrent_participant_count() {
 
     // Some users cancel all their bets
     for user in test.users.iter().take(10) {
-        test.client
-            .cancel_bet(user, &pool_id, &0u32, &bet_amount);
+        test.client.cancel_bet(user, &pool_id, &0u32, &bet_amount);
     }
 
     // Participant count should remain the same (they still participated)
@@ -720,7 +715,9 @@ fn c14_scalability_increasing_users() {
 
         std::println!(
             "Users: {}, Events: {}, Pool Total: {}",
-            num_users, events_emitted, pool.total_a
+            num_users,
+            events_emitted,
+            pool.total_a
         );
     }
 }

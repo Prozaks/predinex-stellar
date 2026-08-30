@@ -35,8 +35,6 @@ mod validation_prop_tests;
 mod verification;
 mod webhook_test;
 
-
-
 // ── Issue #175: Event schema versioning ──────────────────────────────────────
 //
 // Every event emitted by this contract uses the same topic layout:
@@ -901,7 +899,6 @@ pub const CONTRACT_STATE_VERSION: &str = "v1";
 fn event_version(env: &Env) -> Symbol {
     Symbol::new(env, EVENT_SCHEMA_VERSION)
 }
-
 
 // Dispute window: 7 days in seconds (configurable in future)
 const DISPUTE_WINDOW_SECS: u64 = 7 * 24 * 3600;
