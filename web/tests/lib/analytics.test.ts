@@ -7,6 +7,7 @@
 
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { analytics, startTimer, bucketAmount, bucketVolume, bucketOdds } from '../../app/lib/analytics';
+import { __resetRuntimeConfigForTests } from '../../app/lib/runtime-config';
 import type { AnalyticsProvider } from '../../app/lib/analytics/service';
 
 describe('Analytics Taxonomy', () => {
@@ -453,8 +454,7 @@ describe('Analytics Taxonomy', () => {
     it('labels events mainnet when runtime config resolves to mainnet', () => {
       process.env.NEXT_PUBLIC_NETWORK = 'mainnet';
       // Reset runtime-config cache so it re-reads the env.
-      // eslint-disable-next-line @typescript-eslint/no-var-requires
-      require('../../app/lib/runtime-config').__resetRuntimeConfigForTests();
+      __resetRuntimeConfigForTests();
 
       analytics.emit('wallet.connect.attempt', { walletType: 'freighter' });
       const call = trackSpy.mock.calls[trackSpy.mock.calls.length - 1][1];
@@ -463,8 +463,7 @@ describe('Analytics Taxonomy', () => {
 
     it('labels events testnet when runtime config defaults to testnet', () => {
       delete process.env.NEXT_PUBLIC_NETWORK;
-      // eslint-disable-next-line @typescript-eslint/no-var-requires
-      require('../../app/lib/runtime-config').__resetRuntimeConfigForTests();
+      __resetRuntimeConfigForTests();
 
       analytics.emit('wallet.connect.attempt', { walletType: 'freighter' });
       const call = trackSpy.mock.calls[trackSpy.mock.calls.length - 1][1];
@@ -473,8 +472,7 @@ describe('Analytics Taxonomy', () => {
 
     it('setNetworkTypeOverride overrides runtime config at runtime', () => {
       process.env.NEXT_PUBLIC_NETWORK = 'testnet';
-      // eslint-disable-next-line @typescript-eslint/no-var-requires
-      require('../../app/lib/runtime-config').__resetRuntimeConfigForTests();
+      __resetRuntimeConfigForTests();
 
       analytics.setNetworkTypeOverride('mainnet');
       analytics.emit('wallet.connect.attempt', { walletType: 'freighter' });
@@ -489,8 +487,7 @@ describe('Analytics Taxonomy', () => {
 
     it('falls back to testnet when runtime config throws during resolution', () => {
       process.env.NEXT_PUBLIC_NETWORK = 'nonsense-value';
-      // eslint-disable-next-line @typescript-eslint/no-var-requires
-      require('../../app/lib/runtime-config').__resetRuntimeConfigForTests();
+      __resetRuntimeConfigForTests();
 
       analytics.emit('wallet.connect.attempt', { walletType: 'freighter' });
       const call = trackSpy.mock.calls[trackSpy.mock.calls.length - 1][1];
@@ -500,8 +497,7 @@ describe('Analytics Taxonomy', () => {
     it('includes appVersion from runtime-config (or unknown fallback)', () => {
       process.env.NEXT_PUBLIC_APP_VERSION = '1.42.0-test';
       delete process.env.NEXT_PUBLIC_NETWORK;
-      // eslint-disable-next-line @typescript-eslint/no-var-requires
-      require('../../app/lib/runtime-config').__resetRuntimeConfigForTests();
+      __resetRuntimeConfigForTests();
 
       analytics.emit('wallet.connect.attempt', { walletType: 'freighter' });
       const call = trackSpy.mock.calls[trackSpy.mock.calls.length - 1][1];
@@ -511,8 +507,7 @@ describe('Analytics Taxonomy', () => {
     it('falls back appVersion to unknown when NEXT_PUBLIC_APP_VERSION is unset', () => {
       delete process.env.NEXT_PUBLIC_APP_VERSION;
       delete process.env.NEXT_PUBLIC_NETWORK;
-      // eslint-disable-next-line @typescript-eslint/no-var-requires
-      require('../../app/lib/runtime-config').__resetRuntimeConfigForTests();
+      __resetRuntimeConfigForTests();
 
       analytics.emit('wallet.connect.attempt', { walletType: 'freighter' });
       const call = trackSpy.mock.calls[trackSpy.mock.calls.length - 1][1];
