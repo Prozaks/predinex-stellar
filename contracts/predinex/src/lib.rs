@@ -2434,8 +2434,7 @@ impl PredinexContract {
         }
 
         let mut prev_threshold: Option<i128> = None;
-        for i in 0..tiers.len() {
-            let tier = tiers.get(i).unwrap();
+        for tier in tiers.iter() {
             if tier.volume_threshold < 0 {
                 return Err(ContractError::FeeOutOfBounds);
             }
@@ -2491,8 +2490,7 @@ impl PredinexContract {
         // Tiers are stored in strictly ascending threshold order, so the last
         // tier whose threshold is satisfied is the highest matching tier.
         let mut matched: Option<u32> = None;
-        for i in 0..tiers.len() {
-            let tier = tiers.get(i).unwrap();
+        for tier in tiers.iter() {
             if volume >= tier.volume_threshold {
                 matched = Some(tier.fee_bps);
             } else {
@@ -3416,7 +3414,7 @@ impl PredinexContract {
         }
 
         for i in 0..outcomes.len() {
-            let outcome = outcomes.get(i).unwrap();
+            let outcome = outcomes.get(i).ok_or(ContractError::InvalidOutcome)?;
             Self::validate_non_empty_string(
                 &outcome,
                 ContractError::OutcomeEmpty,
@@ -3427,7 +3425,7 @@ impl PredinexContract {
             }
 
             for j in (i + 1)..outcomes.len() {
-                let other = outcomes.get(j).unwrap();
+                let other = outcomes.get(j).ok_or(ContractError::InvalidOutcome)?;
                 if Self::normalize_outcome(env, &outcome) == Self::normalize_outcome(env, &other) {
                     return Err(ContractError::DuplicateOutcomeLabels);
                 }
@@ -3481,9 +3479,9 @@ impl PredinexContract {
 
     fn sum_totals(totals: &Vec<i128>) -> Result<i128, ContractError> {
         let mut total = 0i128;
-        for i in 0..totals.len() {
+        for value in totals.iter() {
             total = total
-                .checked_add(totals.get(i).unwrap())
+                .checked_add(value)
                 .ok_or(ContractError::PoolTotalOverflow)?;
         }
         Ok(total)
@@ -3502,7 +3500,7 @@ impl PredinexContract {
             return Ok(ODDS_SCALE / totals.len() as i128);
         }
 
-        Ok((totals.get(outcome).unwrap() * ODDS_SCALE) / total)
+        Ok((totals.get(outcome).ok_or(ContractError::InvalidOutcome)? * ODDS_SCALE) / total)
     }
 
     fn current_odds(env: &Env, pool_id: u32, pool: &Pool) -> Result<Vec<i128>, ContractError> {
@@ -3585,7 +3583,7 @@ impl PredinexContract {
             return None;
         }
 
-        let mut previous = snapshots.get(0).unwrap();
+        let mut previous = snapshots.get(0)?;
         if target < previous.timestamp {
             return None;
         }
@@ -3594,7 +3592,7 @@ impl PredinexContract {
         }
 
         for i in 1..snapshots.len() {
-            let next = snapshots.get(i).unwrap();
+            let next = snapshots.get(i)?;
             if target == next.timestamp {
                 return Some(next.cumulative_odds_time);
             }
@@ -3727,8 +3725,8 @@ impl PredinexContract {
             None => expiry,
         };
 
-        let outcome_a = outcomes.get(0).unwrap();
-        let outcome_b = outcomes.get(1).unwrap();
+        let outcome_a = outcomes.get(0).ok_or(ContractError::InvalidOutcome)?;
+        let outcome_b = outcomes.get(1).ok_or(ContractError::InvalidOutcome)?;
 
         let pool = Pool {
             creator: creator.clone(),
@@ -4492,7 +4490,7 @@ impl PredinexContract {
             token_client.transfer(&env.current_contract_address(), &fee_recipient, &fee_amount);
         }
 
-        let current_outcome_total = totals.get(outcome).unwrap();
+        let current_outcome_total = totals.get(outcome).ok_or(ContractError::InvalidOutcome)?;
         totals.set(
             outcome,
             current_outcome_total
@@ -4605,7 +4603,9 @@ impl PredinexContract {
         while outcome_bets.len() < outcomes.len() {
             outcome_bets.push_back(0);
         }
-        let current_user_outcome = outcome_bets.get(outcome).unwrap();
+        let current_user_outcome = outcome_bets
+            .get(outcome)
+            .ok_or(ContractError::InvalidOutcome)?;
         outcome_bets.set(
             outcome,
             current_user_outcome
@@ -4768,7 +4768,7 @@ impl PredinexContract {
                 .checked_add(weighted)
                 .ok_or(ContractError::PoolTotalOverflow)?;
             state.last_updated_at = now;
-            state.last_odds = odds.get(outcome).unwrap();
+            state.last_odds = odds.get(outcome).ok_or(ContractError::InvalidOutcome)?;
 
             env.storage()
                 .persistent()
@@ -4963,7 +4963,9 @@ impl PredinexContract {
         while outcome_bets.len() < outcomes.len() {
             outcome_bets.push_back(0);
         }
-        let user_outcome_amount = outcome_bets.get(outcome).unwrap();
+        let user_outcome_amount = outcome_bets
+            .get(outcome)
+            .ok_or(ContractError::InvalidOutcome)?;
 
         // Cannot cancel more than the user staked on this outcome.
         if amount > user_outcome_amount {
@@ -4997,7 +4999,7 @@ impl PredinexContract {
 
         // Reduce the relevant outcome total.
         let mut totals = Self::read_outcome_totals(&env, pool_id, &pool);
-        let current_outcome_total = totals.get(outcome).unwrap();
+        let current_outcome_total = totals.get(outcome).ok_or(ContractError::InvalidOutcome)?;
         totals.set(
             outcome,
             current_outcome_total
@@ -5136,7 +5138,7 @@ impl PredinexContract {
         }
 
         let admin = Self::get_admin(env.clone());
-        let is_admin = admin.is_some() && admin.unwrap() == caller;
+        let is_admin = admin.as_ref() == Some(&caller);
         let is_creator = pool.creator == caller;
         let auth_ok = is_admin || (is_creator && pool.status == PoolStatus::Open);
 
@@ -5454,7 +5456,9 @@ impl PredinexContract {
         // #171 — compute totals for the enriched settlement event.
         // #167 — use configurable protocol fee instead of hard-coded 2%.
         let totals = Self::read_outcome_totals(env, pool_id, &pool);
-        let winning_side_total = totals.get(winning_outcome).unwrap();
+        let winning_side_total = totals
+            .get(winning_outcome)
+            .ok_or(ContractError::InvalidOutcome)?;
         let total_pool_volume = Self::sum_totals(&totals)?;
         // Resolve the fee against any configured volume tiers (flat fee when
         // none apply). When tiers are configured we lock the resolved bps for
@@ -5585,8 +5589,7 @@ impl PredinexContract {
         caller.require_auth();
         let mut results = Vec::new(&env);
         let cap = if pools.len() > 20 { 20 } else { pools.len() };
-        for i in 0..cap {
-            let req = pools.get(i).unwrap();
+        for req in pools.iter().take(cap as usize) {
             let success =
                 Self::settle_single_pool(&env, &caller, req.pool_id, req.winning_outcome).is_ok();
             results.push_back(SettleResult {
@@ -6008,7 +6011,7 @@ impl PredinexContract {
             Self::claim_user_winning_stake(env, pool_id, user.clone(), &user_bet, winning_outcome)?;
 
         let totals = Self::read_outcome_totals(env, pool_id, &pool);
-        let pool_winning_total = totals.get(winning_outcome).unwrap();
+        let pool_winning_total = totals.get(winning_outcome).ok_or(ContractError::InvalidOutcome)?;
         if pool_winning_total == 0 {
             return Err(ContractError::NoWinningBets);
         }
