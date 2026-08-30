@@ -663,6 +663,77 @@ pub fn rotate_treasury_recipient(
 
 ---
 
+## Lending Pool Security Modules
+
+The standalone lending pool security surface lives under `stellar-lend/contracts/hello-world/src`
+with matching off-chain services in `api/src/services` and `oracle/src/services`.
+
+### `TwapOracle::compute_twap`
+
+```rust
+pub fn compute_twap(
+    samples: Vec<OracleSample>,
+    config: TwapConfig,
+    now: u64,
+) -> Result<TwapReading, OracleError>
+```
+
+Computes a liquidity-weighted TWAP from recent price samples. The guard rejects
+non-positive prices, non-positive liquidity, stale samples, insufficient sample
+counts, and windows shorter than `config.min_window_secs`.
+
+### `TwapOracle::validate_spot_price`
+
+```rust
+pub fn validate_spot_price(
+    spot_price: i128,
+    twap_price: i128,
+    max_deviation_bps: u32,
+) -> Result<u32, OracleError>
+```
+
+Returns the spot/TWAP deviation in basis points, or rejects prices that exceed
+the configured manipulation threshold.
+
+### `InterestRateGuard::validate_update`
+
+```rust
+pub fn validate_update(
+    previous: RateObservation,
+    next: RateObservation,
+    config: RateGuardConfig,
+    now: u64,
+) -> Result<(), RateGuardError>
+```
+
+Prevents rate manipulation by bounding absolute interest-rate movement,
+utilization jumps, maximum APR, stale observations, and asset mismatches.
+
+### `MevProtection::validate_operation`
+
+```rust
+pub fn validate_operation(
+    operation: LendingOperation,
+    quote: LendingQuote,
+    config: MevGuardConfig,
+    now: u64,
+) -> Result<(), MevGuardError>
+```
+
+Blocks sandwich-prone lending operations when quotes are stale, the configured
+order delay has not elapsed, liquidity is unavailable, price impact is too high,
+or expected execution slippage exceeds user-safe bounds.
+
+The TypeScript services expose the same policy concepts for API preflight:
+
+| Service | File | Responsibility |
+|---|---|---|
+| `MevProtectionService` | `api/src/services/mev.service.ts` | Preflight lending operations for delay, stale quote, slippage, price impact, cooldown, and sandwich-pattern risk |
+| `PriceAggregator` | `oracle/src/services/price-aggregator.ts` | Maintain samples and validate spot prices against liquidity-weighted TWAP |
+| `PriceValidator` | `oracle/src/services/price-validator.ts` | Validate rate updates against absolute rate, delta, utilization, and freshness policies |
+
+---
+
 ## Event Schema
 
 All events follow the topic layout:
@@ -673,6 +744,39 @@ All events follow the topic layout:
 
 Topic position 0 is the event name; position 1 is always the schema version marker `"v1"`.  
 See `web/docs/CONTRACT_EVENTS.md` for the full per-event payload reference.
+
+### Typed Event Convention (#[contractevent])
+
+All event emission uses Soroban SDK ≥20 `#[contractevent]`-derived types (defined in
+`contract_events` in `lib.rs`). Each event has:
+
+1. A `#[event(name = "...")]` struct inside the `contract_events` module — the name
+   matches the indexer-visible `topic[0]`.
+2. An `emit_<snake_case_name>` helper function that constructs the struct and calls
+   `.publish(env)` with the canonical topic layout.
+
+**Adding a new event:**
+
+```rust
+// 1. Add to contract_events module
+#[event(name = "my_new_event")]
+pub struct MyNewEvent {
+    pub pool_id: u32,
+    // ...payload fields
+}
+
+// 2. Add emit helper
+#[allow(deprecated)]
+fn emit_my_new_event(env: &Env, pool_id: u32) {
+    my_new_event(env, (pool_id,));
+}
+```
+
+**Rules:**
+- Never reuse an event `name` with a breaking topic/payload shape; bump
+  `EVENT_SCHEMA_VERSION` to `"v2"` and add a parallel struct.
+- Every event MUST carry `event_version` ("v1") at topic position 1 — the
+  `emit_*` helpers guarantee this by delegating to the auto-generated function.
 
 ---
 

@@ -1,9 +1,7 @@
 #![no_std]
 // The soroban contractimpl/contractclient macros generate functions that exceed
 // clippy's default argument limit. Allow this for macro-generated code only.
-// TODO(#XXX): Migrate to #[contractevent] instead of deprecated Events::publish
 #![allow(clippy::too_many_arguments)]
-#![allow(deprecated)]
 extern crate alloc;
 use alloc::vec;
 use soroban_sdk::{
@@ -19,12 +17,12 @@ mod create_pool_validation_tests;
 mod creator_deadline_claim_tests;
 mod cross_chain_tests;
 mod e2e_tests;
-mod events;
-mod events_test;
+
 mod fee_config_tests;
 mod fuzz;
 mod fuzz_tests;
 mod integration_tests;
+mod lp_settlement_tests;
 mod lp_tests;
 mod multi_asset_tests;
 mod multi_user_tests;
@@ -34,23 +32,876 @@ mod protocol_fee_tests;
 mod test;
 mod validation_hardening_tests;
 mod validation_prop_tests;
+mod verification;
 mod webhook_test;
 
-// Re-export event types and helpers for backward compatibility
-pub use events::{
-    event_version, BetCancelledEvent, BetEvent, ClaimEvent, ClaimExpiredEvent, ClaimRefundEvent,
-    CreatePoolEvent, FeeConfigUpdatedEvent, PoolBetLimitsSetEvent, PoolCancelledEvent,
-    PoolDurationExtendedEvent, PoolRefundedEvent, PoolSettleRequest, ProtocolFeeSetEvent,
-    ReferralBetEvent, ReferralRewardClaimedEvent, SettleExpiredEvent, SettleResult,
-    SettlePoolEvent, SettlementSource, VoidPoolEvent, EVENT_SCHEMA_VERSION,
-    CONTRACT_STATE_VERSION,
-};
+
 
 // ── Issue #175: Event schema versioning ──────────────────────────────────────
 //
-// Event schema versioning is now handled by the events module (events.rs).
-// All event definitions have been moved there for better organization and
-// maintainability. See events.rs for the unified emission pattern.
+// Every event emitted by this contract uses the same topic layout:
+//
+//   (Symbol(event_name), Symbol(EVENT_SCHEMA_VERSION), ...identifiers)
+//
+// Topic position 0 is the event name (e.g. `create_pool`). Topic position 1 is
+// always the schema version marker (currently `"v1"`). Subsequent topics carry
+// pool / user identifiers as before. Indexers and frontend consumers can
+// therefore pin a specific schema version with a positional topic filter, e.g.
+// `[["create_pool", "v1"]]`, and reject events whose version they do not yet
+// understand instead of silently mis-decoding payloads.
+//
+// Upgrade rules for future schema changes:
+//   * A backward-compatible payload extension (additional optional fields)
+//     SHOULD reuse the same version marker.
+//   * A breaking change to topics or data shape MUST bump the version marker
+//     (e.g. `"v2"`) and be documented in `web/docs/CONTRACT_EVENTS.md`.
+//   * The contract MUST never emit two version markers for the same event in
+//     the same release; consumers can rely on exactly one version per event.
+//
+// See `web/docs/CONTRACT_EVENTS.md` for the full per-event schema and the
+// upgrade expectations published to consumers.
+pub const EVENT_SCHEMA_VERSION: &str = "v1";
+
+// â”€â”€ Emit helpers â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+//
+// These thin wrappers publish typed events via `env.events().publish()`.
+// Topic layout: (Symbol(event_name), Symbol("v1"), â€¦pool_id/user/â€¦).
+// Data payload: event-specific fields as a tuple or single value.
+
+fn emit_fee_config_updated(
+    env: &Env,
+    old_fee_rate: i128,
+    old_fee_recipient: Option<Address>,
+    fee_rate: i128,
+    fee_recipient: Address,
+) {
+    env.events().publish(
+        (Symbol::new(env, "FeeConfigUpdated"), event_version(env)),
+        (old_fee_rate, old_fee_recipient, fee_rate, fee_recipient),
+    );
+}
+
+fn emit_creation_fee_set(env: &Env, old_fee: i128, fee: i128) {
+    env.events().publish(
+        (Symbol::new(env, "creation_fee_set"), event_version(env)),
+        (old_fee, fee),
+    );
+}
+
+fn emit_creation_fee_exemption_set(env: &Env, account: Address, exempt: bool) {
+    env.events().publish(
+        (
+            Symbol::new(env, "creation_fee_exemption_set"),
+            event_version(env),
+        ),
+        (account, exempt),
+    );
+}
+
+fn emit_protocol_fee_set(env: &Env, caller: Address, old_fee_bps: u32, fee_bps: u32) {
+    env.events().publish(
+        (Symbol::new(env, "protocol_fee_set"), event_version(env)),
+        (caller, old_fee_bps, fee_bps),
+    );
+}
+
+fn emit_volume_fee_tiers_set(env: &Env, caller: Address, tiers: Vec<FeeTier>) {
+    env.events().publish(
+        (Symbol::new(env, "volume_fee_tiers_set"), event_version(env)),
+        (caller, tiers),
+    );
+}
+
+fn emit_pool_bet_limits_set(
+    env: &Env,
+    pool_id: u32,
+    old_min_bet: i128,
+    old_max_bet: i128,
+    min_bet: i128,
+    max_bet: i128,
+) {
+    env.events().publish(
+        (
+            Symbol::new(env, "pool_bet_limits_set"),
+            event_version(env),
+            pool_id,
+        ),
+        (old_min_bet, old_max_bet, min_bet, max_bet),
+    );
+}
+
+fn emit_circuit_breaker_config_set(
+    env: &Env,
+    old_max_pool_size: i128,
+    old_large_pool_threshold: i128,
+    old_cooling_period_secs: u64,
+    max_pool_size: i128,
+    large_pool_threshold: i128,
+    cooling_period_secs: u64,
+) {
+    env.events().publish(
+        (
+            Symbol::new(env, "circuit_breaker_config_set"),
+            event_version(env),
+        ),
+        (
+            old_max_pool_size,
+            old_large_pool_threshold,
+            old_cooling_period_secs,
+            max_pool_size,
+            large_pool_threshold,
+            cooling_period_secs,
+        ),
+    );
+}
+
+fn emit_rate_limit_config_set(
+    env: &Env,
+    old_max_bets_per_window: u32,
+    old_window_secs: u64,
+    max_bets_per_window: u32,
+    window_secs: u64,
+) {
+    env.events().publish(
+        (
+            Symbol::new(env, "rate_limit_config_set"),
+            event_version(env),
+        ),
+        (
+            old_max_bets_per_window,
+            old_window_secs,
+            max_bets_per_window,
+            window_secs,
+        ),
+    );
+}
+
+fn emit_user_exposure_config_set(
+    env: &Env,
+    max_exposure_per_pool_bps: u32,
+    max_bet_per_transaction: i128,
+    daily_loss_limit: i128,
+    weekly_loss_limit: i128,
+    large_bet_cooldown_secs: u64,
+    large_bet_threshold: i128,
+) {
+    env.events().publish(
+        (
+            Symbol::new(env, "user_exposure_config_set"),
+            event_version(env),
+        ),
+        (
+            max_exposure_per_pool_bps,
+            max_bet_per_transaction,
+            daily_loss_limit,
+            weekly_loss_limit,
+            large_bet_cooldown_secs,
+            large_bet_threshold,
+        ),
+    );
+}
+
+fn emit_user_bet_limit_exceeded(env: &Env, user: Address, pool_id: u32, amount: i128, max: i128) {
+    env.events().publish(
+        (
+            Symbol::new(env, "user_bet_limit_exceeded"),
+            event_version(env),
+            user,
+            pool_id,
+        ),
+        (amount, max),
+    );
+}
+
+fn emit_user_exposure_limit_exceeded(
+    env: &Env,
+    user: Address,
+    pool_id: u32,
+    new_exposure: i128,
+    max_exposure: i128,
+) {
+    env.events().publish(
+        (
+            Symbol::new(env, "user_exposure_limit_exceeded"),
+            event_version(env),
+            user,
+            pool_id,
+        ),
+        (new_exposure, max_exposure),
+    );
+}
+
+fn emit_user_daily_loss_limit_exceeded(
+    env: &Env,
+    user: Address,
+    potential_loss: i128,
+    limit: i128,
+) {
+    env.events().publish(
+        (
+            Symbol::new(env, "user_daily_loss_limit_exceeded"),
+            event_version(env),
+            user,
+        ),
+        (potential_loss, limit),
+    );
+}
+
+fn emit_user_weekly_loss_limit_exceeded(
+    env: &Env,
+    user: Address,
+    potential_loss: i128,
+    limit: i128,
+) {
+    env.events().publish(
+        (
+            Symbol::new(env, "user_weekly_loss_limit_exceeded"),
+            event_version(env),
+            user,
+        ),
+        (potential_loss, limit),
+    );
+}
+
+fn emit_user_large_bet_cooldown_active(env: &Env, user: Address, amount: i128, cooldown_secs: u64) {
+    env.events().publish(
+        (
+            Symbol::new(env, "user_large_bet_cooldown_active"),
+            event_version(env),
+            user,
+        ),
+        (amount, cooldown_secs),
+    );
+}
+
+fn emit_create_pool(env: &Env, pool_id: u32, payload: CreatePoolEvent) {
+    env.events().publish(
+        (Symbol::new(env, "create_pool"), event_version(env), pool_id),
+        payload,
+    );
+}
+
+fn emit_pool_scheduled(env: &Env, pool_id: u32, creator: Address, open_at: u64) {
+    env.events().publish(
+        (
+            Symbol::new(env, "pool_scheduled"),
+            event_version(env),
+            pool_id,
+        ),
+        (creator, open_at),
+    );
+}
+
+fn emit_scheduled_pool_activated(env: &Env, pool_id: u32, open_at: u64) {
+    env.events().publish(
+        (
+            Symbol::new(env, "scheduled_pool_activated"),
+            event_version(env),
+            pool_id,
+        ),
+        open_at,
+    );
+}
+
+fn emit_scheduled_pool_cancelled(env: &Env, pool_id: u32, creator: Address) {
+    env.events().publish(
+        (
+            Symbol::new(env, "scheduled_pool_cancelled"),
+            event_version(env),
+            pool_id,
+        ),
+        creator,
+    );
+}
+
+fn emit_pool_cooling_started(env: &Env, pool_id: u32, cooling_until: u64, new_total: i128) {
+    env.events().publish(
+        (
+            Symbol::new(env, "pool_cooling_started"),
+            event_version(env),
+            pool_id,
+        ),
+        (cooling_until, new_total),
+    );
+}
+
+fn emit_twap_updated(env: &Env, pool_id: u32, payload: TwapUpdatedEvent) {
+    env.events().publish(
+        (
+            Symbol::new(env, "twap_updated"),
+            event_version(env),
+            pool_id,
+        ),
+        payload,
+    );
+}
+
+fn emit_place_bet(env: &Env, pool_id: u32, user: Address, payload: BetEvent) {
+    env.events().publish(
+        (
+            Symbol::new(env, "place_bet"),
+            event_version(env),
+            pool_id,
+            user,
+        ),
+        payload,
+    );
+}
+
+fn emit_referral_bet(env: &Env, pool_id: u32, payload: ReferralBetEvent) {
+    env.events().publish(
+        (
+            Symbol::new(env, "referral_bet"),
+            event_version(env),
+            pool_id,
+        ),
+        payload,
+    );
+}
+
+fn emit_bet_cancelled(env: &Env, pool_id: u32, user: Address, payload: BetCancelledEvent) {
+    env.events().publish(
+        (
+            Symbol::new(env, "bet_cancelled"),
+            event_version(env),
+            pool_id,
+            user,
+        ),
+        payload,
+    );
+}
+
+fn emit_cancel_pool(env: &Env, pool_id: u32, payload: PoolCancelledEvent) {
+    env.events().publish(
+        (Symbol::new(env, "cancel_pool"), event_version(env), pool_id),
+        payload,
+    );
+}
+
+fn emit_pool_duration_extended(env: &Env, pool_id: u32, payload: PoolDurationExtendedEvent) {
+    env.events().publish(
+        (
+            Symbol::new(env, "pool_duration_extended"),
+            event_version(env),
+            pool_id,
+        ),
+        payload,
+    );
+}
+
+fn emit_assign_settler(env: &Env, pool_id: u32, creator: Address, settler: Address) {
+    env.events().publish(
+        (
+            Symbol::new(env, "assign_settler"),
+            event_version(env),
+            pool_id,
+        ),
+        (creator, settler),
+    );
+}
+
+fn emit_min_settlement_participants_set(env: &Env, old_min: u32, min_participants: u32) {
+    env.events().publish(
+        (
+            Symbol::new(env, "min_settlement_participants_set"),
+            event_version(env),
+        ),
+        (old_min, min_participants),
+    );
+}
+
+fn emit_settle_pool(env: &Env, pool_id: u32, payload: SettlePoolEvent) {
+    env.events().publish(
+        (Symbol::new(env, "settle_pool"), event_version(env), pool_id),
+        payload,
+    );
+}
+
+fn emit_void_pool(env: &Env, pool_id: u32, caller: Address) {
+    env.events().publish(
+        (Symbol::new(env, "void_pool"), event_version(env), pool_id),
+        caller,
+    );
+}
+
+fn emit_claim_refund(env: &Env, pool_id: u32, user: Address, refund: i128) {
+    env.events().publish(
+        (
+            Symbol::new(env, "claim_refund"),
+            event_version(env),
+            pool_id,
+            user,
+        ),
+        refund,
+    );
+}
+
+fn emit_claim_expired(env: &Env, pool_id: u32, user: Address, refund: i128) {
+    env.events().publish(
+        (
+            Symbol::new(env, "claim_expired"),
+            event_version(env),
+            pool_id,
+            user,
+        ),
+        refund,
+    );
+}
+
+fn emit_refund_expired_pool(env: &Env, pool_id: u32, payload: PoolRefundedEvent) {
+    env.events().publish(
+        (
+            Symbol::new(env, "refund_expired_pool"),
+            event_version(env),
+            pool_id,
+        ),
+        payload,
+    );
+}
+
+fn emit_claim_winnings(env: &Env, pool_id: u32, user: Address, payload: ClaimEvent) {
+    env.events().publish(
+        (
+            Symbol::new(env, "claim_winnings"),
+            event_version(env),
+            pool_id,
+            user,
+        ),
+        payload,
+    );
+}
+
+fn emit_claim_scheduled(env: &Env, pool_id: u32, user: Address, id: u32, claim_at: u64) {
+    env.events().publish(
+        (
+            Symbol::new(env, "claim_scheduled"),
+            event_version(env),
+            pool_id,
+            user,
+        ),
+        (id, claim_at),
+    );
+}
+
+fn emit_scheduled_claim_cancelled(env: &Env, pool_id: u32, user: Address, id: u32) {
+    env.events().publish(
+        (
+            Symbol::new(env, "scheduled_claim_cancelled"),
+            event_version(env),
+            pool_id,
+            user,
+        ),
+        id,
+    );
+}
+
+fn emit_scheduled_claim_executed(env: &Env, pool_id: u32, user: Address, id: u32, amount: i128) {
+    env.events().publish(
+        (
+            Symbol::new(env, "scheduled_claim_executed"),
+            event_version(env),
+            pool_id,
+            user,
+        ),
+        (id, amount),
+    );
+}
+
+fn emit_treasury_withdraw_limit_set(
+    env: &Env,
+    max_withdrawal_per_window: i128,
+    withdrawal_window_secs: u64,
+) {
+    env.events().publish(
+        (
+            Symbol::new(env, "treasury_withdraw_limit_set"),
+            event_version(env),
+        ),
+        (max_withdrawal_per_window, withdrawal_window_secs),
+    );
+}
+
+fn emit_treasury_recipient_rotated(env: &Env, current_recipient: Address, new_recipient: Address) {
+    env.events().publish(
+        (
+            Symbol::new(env, "treasury_recipient_rotated"),
+            event_version(env),
+        ),
+        (current_recipient, new_recipient),
+    );
+}
+
+fn emit_treasury_withdrawn(env: &Env, caller: Address, treasury_recipient: Address, amount: i128) {
+    env.events().publish(
+        (Symbol::new(env, "treasury_withdrawn"), event_version(env)),
+        (caller, treasury_recipient, amount),
+    );
+}
+
+fn emit_freeze_admin_set(env: &Env, old_freeze_admin: Option<Address>, freeze_admin: Address) {
+    env.events().publish(
+        (Symbol::new(env, "freeze_admin_set"), event_version(env)),
+        (old_freeze_admin, freeze_admin),
+    );
+}
+
+fn emit_pool_paused(env: &Env, caller: Address) {
+    env.events()
+        .publish((Symbol::new(env, "PoolPaused"), event_version(env)), caller);
+}
+
+fn emit_pool_unpaused(env: &Env, caller: Address) {
+    env.events().publish(
+        (Symbol::new(env, "PoolUnpaused"), event_version(env)),
+        caller,
+    );
+}
+
+fn emit_admin_set(env: &Env, old_admin: Option<Address>, admin: Address) {
+    env.events().publish(
+        (Symbol::new(env, "admin_set"), event_version(env)),
+        (old_admin, admin),
+    );
+}
+
+fn emit_bridge_timeout_set(env: &Env, timeout_secs: u64) {
+    env.events().publish(
+        (Symbol::new(env, "bridge_timeout_set"), event_version(env)),
+        timeout_secs,
+    );
+}
+
+fn emit_cross_chain_dispute_window_set(env: &Env, window_secs: u64) {
+    env.events().publish(
+        (
+            Symbol::new(env, "cross_chain_dispute_window_set"),
+            event_version(env),
+        ),
+        window_secs,
+    );
+}
+
+fn emit_cross_chain_settled(env: &Env, pool_id: u32, payload: CrossChainSettlementEvent) {
+    env.events().publish(
+        (
+            Symbol::new(env, "cross_chain_settled"),
+            event_version(env),
+            pool_id,
+        ),
+        payload,
+    );
+}
+
+fn emit_dispute_window_set(env: &Env, window_secs: u64) {
+    env.events().publish(
+        (Symbol::new(env, "dispute_window_set"), event_version(env)),
+        window_secs,
+    );
+}
+
+fn emit_lp_deposit(env: &Env, pool_id: u32, user: Address, payload: LpDepositEvent) {
+    env.events().publish(
+        (
+            Symbol::new(env, "lp_deposit"),
+            event_version(env),
+            pool_id,
+            user,
+        ),
+        payload,
+    );
+}
+
+fn emit_lp_fee_allocation_set(env: &Env, fee_allocation_bps: u32) {
+    env.events().publish(
+        (
+            Symbol::new(env, "lp_fee_allocation_set"),
+            event_version(env),
+        ),
+        fee_allocation_bps,
+    );
+}
+
+fn emit_lp_reward_claimed(env: &Env, pool_id: u32, user: Address, payload: LpRewardClaimEvent) {
+    env.events().publish(
+        (
+            Symbol::new(env, "lp_reward_claimed"),
+            event_version(env),
+            pool_id,
+            user,
+        ),
+        payload,
+    );
+}
+
+fn emit_lp_rewards_distributed(env: &Env, pool_id: u32, amount: i128) {
+    env.events().publish(
+        (
+            Symbol::new(env, "lp_rewards_distributed"),
+            event_version(env),
+            pool_id,
+        ),
+        amount,
+    );
+}
+
+fn emit_lp_stake_boost_set(env: &Env, boost_bps: u32) {
+    env.events().publish(
+        (Symbol::new(env, "lp_stake_boost_set"), event_version(env)),
+        boost_bps,
+    );
+}
+
+fn emit_lp_staked(env: &Env, pool_id: u32, user: Address, new_staked: i128, lock_until: u64) {
+    env.events().publish(
+        (
+            Symbol::new(env, "lp_staked"),
+            event_version(env),
+            pool_id,
+            user,
+        ),
+        (new_staked, lock_until),
+    );
+}
+
+fn emit_lp_unstaked(env: &Env, pool_id: u32, user: Address, released: i128) {
+    env.events().publish(
+        (
+            Symbol::new(env, "lp_unstaked"),
+            event_version(env),
+            pool_id,
+            user,
+        ),
+        released,
+    );
+}
+
+fn emit_lp_withdraw(env: &Env, pool_id: u32, user: Address, payload: LpWithdrawEvent) {
+    env.events().publish(
+        (
+            Symbol::new(env, "lp_withdraw"),
+            event_version(env),
+            pool_id,
+            user,
+        ),
+        payload,
+    );
+}
+
+fn emit_mirror_created(env: &Env, pool_id: u32, payload: MirrorCreatedEvent) {
+    env.events().publish(
+        (
+            Symbol::new(env, "mirror_created"),
+            event_version(env),
+            pool_id,
+        ),
+        payload,
+    );
+}
+
+fn emit_pool_cooling_overridden(env: &Env, pool_id: u32, caller: Address) {
+    env.events().publish(
+        (
+            Symbol::new(env, "pool_cooling_overridden"),
+            event_version(env),
+            pool_id,
+        ),
+        caller,
+    );
+}
+
+fn emit_pool_created_from_template(env: &Env, template_id: u32, pool_id: u32) {
+    env.events().publish(
+        (
+            Symbol::new(env, "pool_created_from_template"),
+            event_version(env),
+            template_id,
+            pool_id,
+        ),
+        (),
+    );
+}
+
+fn emit_pool_disputed(env: &Env, pool_id: u32, caller: Address) {
+    env.events().publish(
+        (
+            Symbol::new(env, "pool_disputed"),
+            event_version(env),
+            pool_id,
+        ),
+        caller,
+    );
+}
+
+fn emit_pool_ext_metadata_set(env: &Env, pool_id: u32, creator: Address) {
+    env.events().publish(
+        (
+            Symbol::new(env, "pool_ext_metadata_set"),
+            event_version(env),
+            pool_id,
+        ),
+        creator,
+    );
+}
+
+fn emit_pool_frozen(env: &Env, pool_id: u32, caller: Address) {
+    env.events().publish(
+        (Symbol::new(env, "pool_frozen"), event_version(env), pool_id),
+        caller,
+    );
+}
+
+fn emit_pool_metadata_cleared(env: &Env, pool_id: u32, creator: Address) {
+    env.events().publish(
+        (
+            Symbol::new(env, "pool_metadata_cleared"),
+            event_version(env),
+            pool_id,
+        ),
+        creator,
+    );
+}
+
+fn emit_pool_metadata_set(env: &Env, pool_id: u32, uri: String) {
+    env.events().publish(
+        (
+            Symbol::new(env, "pool_metadata_set"),
+            event_version(env),
+            pool_id,
+        ),
+        uri,
+    );
+}
+
+fn emit_pool_template_created(env: &Env, template_id: u32, title: String) {
+    env.events().publish(
+        (
+            Symbol::new(env, "pool_template_created"),
+            event_version(env),
+            template_id,
+        ),
+        title,
+    );
+}
+
+fn emit_pool_template_deleted(env: &Env, template_id: u32) {
+    env.events().publish(
+        (
+            Symbol::new(env, "pool_template_deleted"),
+            event_version(env),
+            template_id,
+        ),
+        (),
+    );
+}
+
+fn emit_pool_template_updated(env: &Env, template_id: u32, title: String) {
+    env.events().publish(
+        (
+            Symbol::new(env, "pool_template_updated"),
+            event_version(env),
+            template_id,
+        ),
+        title,
+    );
+}
+
+fn emit_pool_token_bet_limits_set(
+    env: &Env,
+    pool_id: u32,
+    token: Address,
+    old_min: i128,
+    old_max: i128,
+    min_bet: i128,
+    max_bet: i128,
+) {
+    env.events().publish(
+        (
+            Symbol::new(env, "pool_token_bet_limits_set"),
+            event_version(env),
+            pool_id,
+            token,
+        ),
+        (old_min, old_max, min_bet, max_bet),
+    );
+}
+
+fn emit_pool_unfrozen(env: &Env, pool_id: u32, caller: Address) {
+    env.events().publish(
+        (
+            Symbol::new(env, "pool_unfrozen"),
+            event_version(env),
+            pool_id,
+        ),
+        caller,
+    );
+}
+
+fn emit_referral_bps_set(env: &Env, caller: Address, old_bps: u32, bps: u32) {
+    env.events().publish(
+        (Symbol::new(env, "referral_bps_set"), event_version(env)),
+        (caller, old_bps, bps),
+    );
+}
+
+fn emit_referral_reward_claimed(env: &Env, payload: ReferralRewardClaimedEvent) {
+    env.events().publish(
+        (
+            Symbol::new(env, "referral_reward_claimed"),
+            event_version(env),
+        ),
+        payload,
+    );
+}
+
+fn emit_token_rate_set(env: &Env, token: Address, old_rate: Option<i128>, rate_bps: i128) {
+    env.events().publish(
+        (Symbol::new(env, "token_rate_set"), event_version(env)),
+        (token, old_rate, rate_bps),
+    );
+}
+
+fn emit_tokens_rescued(env: &Env, token: Address, to: Address, amount: i128) {
+    env.events().publish(
+        (Symbol::new(env, "tokens_rescued"), event_version(env)),
+        (token, to, amount),
+    );
+}
+
+fn emit_webhook_registered(env: &Env, url: String, event_types_len: u32) {
+    env.events().publish(
+        (Symbol::new(env, "webhook_registered"), event_version(env)),
+        (url, event_types_len),
+    );
+}
+
+fn emit_webhook_unregistered(env: &Env, url: String) {
+    env.events().publish(
+        (Symbol::new(env, "webhook_unregistered"), event_version(env)),
+        url,
+    );
+}
+
+fn emit_contract_paused(env: &Env, caller: Address) {
+    env.events().publish(
+        (Symbol::new(env, "contract_paused"), event_version(env)),
+        caller,
+    );
+}
+
+fn emit_contract_unpaused(env: &Env, caller: Address) {
+    env.events().publish(
+        (Symbol::new(env, "contract_unpaused"), event_version(env)),
+        caller,
+    );
+}
+
+pub const CONTRACT_STATE_VERSION: &str = "v1";
+
+/// Build the schema-version `Symbol` used as topic position 1 on every event.
+fn event_version(env: &Env) -> Symbol {
+    Symbol::new(env, EVENT_SCHEMA_VERSION)
+}
+
 
 // Dispute window: 7 days in seconds (configurable in future)
 const DISPUTE_WINDOW_SECS: u64 = 7 * 24 * 3600;
@@ -1197,8 +2048,7 @@ impl PredinexContract {
         env.storage().persistent().set(&DataKey::FeeRate, &0u32);
         env.storage().persistent().set(&DataKey::Treasury, &0i128);
         env.storage().persistent().set(&DataKey::Admin, &admin);
-        env.events()
-            .publish((Symbol::new(&env, "AdminSet"), event_version(&env)), admin);
+        emit_admin_set(&env, None, admin);
         // #191 — persist the contract state schema version on initialization.
         env.storage().persistent().set(
             &DataKey::ContractVersion,
@@ -1244,14 +2094,12 @@ impl PredinexContract {
         env.storage()
             .persistent()
             .set(&DataKey::FeeRecipient, &fee_recipient);
-        env.events().publish(
-            (Symbol::new(&env, "FeeConfigUpdated"), event_version(&env)),
-            (
-                old_fee_rate,
-                old_fee_recipient,
-                fee_rate,
-                fee_recipient.clone(),
-            ),
+        emit_fee_config_updated(
+            &env,
+            old_fee_rate.into(),
+            Some(old_fee_recipient),
+            fee_rate.into(),
+            fee_recipient.clone(),
         );
         Ok(())
     }
@@ -1292,10 +2140,7 @@ impl PredinexContract {
             .get(&DataKey::CreationFee)
             .unwrap_or(0);
         env.storage().persistent().set(&DataKey::CreationFee, &fee);
-        env.events().publish(
-            (Symbol::new(&env, "creation_fee_set"), event_version(&env)),
-            (old_fee, fee),
-        );
+        emit_creation_fee_set(&env, old_fee, fee);
         Ok(())
     }
 
@@ -1338,13 +2183,7 @@ impl PredinexContract {
             env.storage().persistent().remove(&key);
         }
 
-        env.events().publish(
-            (
-                Symbol::new(&env, "creation_fee_exemption_set"),
-                event_version(&env),
-            ),
-            (account, exempt),
-        );
+        emit_creation_fee_exemption_set(&env, account, exempt);
         Ok(())
     }
 
@@ -1385,10 +2224,7 @@ impl PredinexContract {
             .persistent()
             .set(&DataKey::ProtocolFee, &fee_bps);
 
-        env.events().publish(
-            (Symbol::new(&env, "protocol_fee_set"), event_version(&env)),
-            (caller, old_fee_bps, fee_bps),
-        );
+        emit_protocol_fee_set(&env, caller, old_fee_bps, fee_bps);
         Ok(())
     }
 
@@ -1469,13 +2305,7 @@ impl PredinexContract {
             );
         }
 
-        env.events().publish(
-            (
-                Symbol::new(&env, "volume_fee_tiers_set"),
-                event_version(&env),
-            ),
-            (caller, tiers),
-        );
+        emit_volume_fee_tiers_set(&env, caller, tiers);
         Ok(())
     }
 
@@ -1676,14 +2506,7 @@ impl PredinexContract {
             POOL_BUMP_TARGET,
         );
 
-        env.events().publish(
-            (
-                Symbol::new(&env, "pool_bet_limits_set"),
-                event_version(&env),
-                pool_id,
-            ),
-            (old_min_bet, old_max_bet, min_bet, max_bet),
-        );
+        emit_pool_bet_limits_set(&env, pool_id, old_min_bet, old_max_bet, min_bet, max_bet);
         Ok(())
     }
 
@@ -1739,19 +2562,14 @@ impl PredinexContract {
             .persistent()
             .set(&DataKey::LargePoolCoolingPeriodSecs, &cooling_period_secs);
 
-        env.events().publish(
-            (
-                Symbol::new(&env, "circuit_breaker_config_set"),
-                event_version(&env),
-            ),
-            (
-                old_max_pool_size,
-                old_large_pool_threshold,
-                old_cooling_period_secs,
-                max_pool_size,
-                large_pool_threshold,
-                cooling_period_secs,
-            ),
+        emit_circuit_breaker_config_set(
+            &env,
+            old_max_pool_size,
+            old_large_pool_threshold,
+            old_cooling_period_secs,
+            max_pool_size,
+            large_pool_threshold,
+            cooling_period_secs,
         );
         Ok(())
     }
@@ -1814,17 +2632,12 @@ impl PredinexContract {
             .persistent()
             .set(&DataKey::RateLimitWindowSecs, &window_secs);
 
-        env.events().publish(
-            (
-                Symbol::new(&env, "rate_limit_config_set"),
-                event_version(&env),
-            ),
-            (
-                old_max_bets_per_window,
-                old_window_secs,
-                max_bets_per_window,
-                window_secs,
-            ),
+        emit_rate_limit_config_set(
+            &env,
+            old_max_bets_per_window,
+            old_window_secs,
+            max_bets_per_window,
+            window_secs,
         );
         Ok(())
     }
@@ -1957,19 +2770,14 @@ impl PredinexContract {
             .persistent()
             .set(&DataKey::UserLargeBetThreshold, &config.large_bet_threshold);
 
-        env.events().publish(
-            (
-                Symbol::new(&env, "user_exposure_config_set"),
-                event_version(&env),
-            ),
-            (
-                max_exposure_per_pool_bps,
-                max_bet_per_transaction,
-                daily_loss_limit,
-                weekly_loss_limit,
-                large_bet_cooldown_secs,
-                large_bet_threshold,
-            ),
+        emit_user_exposure_config_set(
+            &env,
+            max_exposure_per_pool_bps,
+            max_bet_per_transaction,
+            daily_loss_limit,
+            weekly_loss_limit,
+            large_bet_cooldown_secs,
+            large_bet_threshold,
         );
         Ok(())
     }
@@ -2096,17 +2904,12 @@ impl PredinexContract {
 
         // Check max bet per transaction
         if config.max_bet_per_transaction > 0 && amount > config.max_bet_per_transaction {
-            env.events().publish(
-                (
-                    Symbol::new(env, "user_bet_limit_exceeded"),
-                    event_version(env),
-                ),
-                (
-                    user.clone(),
-                    pool_id,
-                    amount,
-                    config.max_bet_per_transaction,
-                ),
+            emit_user_bet_limit_exceeded(
+                env,
+                user.clone(),
+                pool_id,
+                amount,
+                config.max_bet_per_transaction,
             );
             return Err(ContractError::BetExceedsMaxBetPerTx);
         }
@@ -2136,12 +2939,12 @@ impl PredinexContract {
                 / 10_000;
 
             if max_exposure > 0 && new_exposure > max_exposure {
-                env.events().publish(
-                    (
-                        Symbol::new(env, "user_exposure_limit_exceeded"),
-                        event_version(env),
-                    ),
-                    (user.clone(), pool_id, new_exposure, max_exposure),
+                emit_user_exposure_limit_exceeded(
+                    env,
+                    user.clone(),
+                    pool_id,
+                    new_exposure,
+                    max_exposure,
                 );
                 return Err(ContractError::ExposureLimitExceeded);
             }
@@ -2165,12 +2968,11 @@ impl PredinexContract {
                 .checked_add(amount)
                 .ok_or(ContractError::PoolTotalOverflow)?;
             if potential_loss > config.daily_loss_limit {
-                env.events().publish(
-                    (
-                        Symbol::new(env, "user_daily_loss_limit_exceeded"),
-                        event_version(env),
-                    ),
-                    (user.clone(), potential_loss, config.daily_loss_limit),
+                emit_user_daily_loss_limit_exceeded(
+                    env,
+                    user.clone(),
+                    potential_loss,
+                    config.daily_loss_limit,
                 );
                 return Err(ContractError::DailyLossLimitExceeded);
             }
@@ -2191,12 +2993,11 @@ impl PredinexContract {
                 .checked_add(amount)
                 .ok_or(ContractError::PoolTotalOverflow)?;
             if potential_loss > config.weekly_loss_limit {
-                env.events().publish(
-                    (
-                        Symbol::new(env, "user_weekly_loss_limit_exceeded"),
-                        event_version(env),
-                    ),
-                    (user.clone(), potential_loss, config.weekly_loss_limit),
+                emit_user_weekly_loss_limit_exceeded(
+                    env,
+                    user.clone(),
+                    potential_loss,
+                    config.weekly_loss_limit,
                 );
                 return Err(ContractError::WeeklyLossLimitExceeded);
             }
@@ -2220,12 +3021,11 @@ impl PredinexContract {
             if last_large_bet_ts
                 .is_some_and(|ts| now.saturating_sub(ts) < config.large_bet_cooldown_secs)
             {
-                env.events().publish(
-                    (
-                        Symbol::new(env, "user_large_bet_cooldown_active"),
-                        event_version(env),
-                    ),
-                    (user.clone(), amount, config.large_bet_cooldown_secs),
+                emit_user_large_bet_cooldown_active(
+                    env,
+                    user.clone(),
+                    amount,
+                    config.large_bet_cooldown_secs,
                 );
                 return Err(ContractError::LargeBetCooldownActive);
             }
@@ -2888,8 +3688,9 @@ impl PredinexContract {
             .persistent()
             .set(&DataKey::PoolCounter, &pool_id);
 
-        env.events().publish(
-            (Symbol::new(env, "create_pool"), event_version(env), pool_id),
+        emit_create_pool(
+            env,
+            pool_id,
             CreatePoolEvent {
                 creator,
                 expiry,
@@ -3177,14 +3978,7 @@ impl PredinexContract {
             POOL_BUMP_THRESHOLD,
             POOL_BUMP_TARGET,
         );
-        env.events().publish(
-            (
-                Symbol::new(&env, "pool_scheduled"),
-                event_version(&env),
-                pool_id,
-            ),
-            (creator, open_at),
-        );
+        emit_pool_scheduled(&env, pool_id, creator, open_at);
         Ok(pool_id)
     }
 
@@ -3230,14 +4024,7 @@ impl PredinexContract {
             POOL_BUMP_THRESHOLD,
             POOL_BUMP_TARGET,
         );
-        env.events().publish(
-            (
-                Symbol::new(&env, "scheduled_pool_activated"),
-                event_version(&env),
-                pool_id,
-            ),
-            open_at,
-        );
+        emit_scheduled_pool_activated(&env, pool_id, open_at);
         Ok(())
     }
 
@@ -3287,14 +4074,7 @@ impl PredinexContract {
             POOL_BUMP_THRESHOLD,
             POOL_BUMP_TARGET,
         );
-        env.events().publish(
-            (
-                Symbol::new(&env, "scheduled_pool_cancelled"),
-                event_version(&env),
-                pool_id,
-            ),
-            creator,
-        );
+        emit_scheduled_pool_cancelled(&env, pool_id, creator);
         Ok(())
     }
 
@@ -3701,13 +4481,10 @@ impl PredinexContract {
         let total_yes = pool.total_a;
         let total_no = pool.total_b;
 
-        env.events().publish(
-            (
-                Symbol::new(&env, "place_bet"),
-                event_version(&env),
-                pool_id,
-                user.clone(),
-            ),
+        emit_place_bet(
+            &env,
+            pool_id,
+            user.clone(),
             BetEvent {
                 outcome,
                 amount: net_amount,
@@ -3718,12 +4495,9 @@ impl PredinexContract {
 
         // #356 — emit referral_bet event alongside place_bet when referrer present.
         if let Some(ref_referrer) = referrer {
-            env.events().publish(
-                (
-                    Symbol::new(&env, "referral_bet"),
-                    event_version(&env),
-                    pool_id,
-                ),
+            emit_referral_bet(
+                &env,
+                pool_id,
                 ReferralBetEvent {
                     referrer: ref_referrer,
                     pool_id,
@@ -3781,14 +4555,7 @@ impl PredinexContract {
                 POOL_BUMP_THRESHOLD,
                 POOL_BUMP_TARGET,
             );
-            env.events().publish(
-                (
-                    Symbol::new(&env, "pool_cooling_started"),
-                    event_version(&env),
-                    pool_id,
-                ),
-                (cooling_until, new_total),
-            );
+            emit_pool_cooling_started(&env, pool_id, cooling_until, new_total);
         }
         Ok(())
     }
@@ -3857,12 +4624,9 @@ impl PredinexContract {
             POOL_BUMP_THRESHOLD,
             POOL_BUMP_TARGET,
         );
-        env.events().publish(
-            (
-                Symbol::new(&env, "twap_updated"),
-                event_version(&env),
-                pool_id,
-            ),
+        emit_twap_updated(
+            &env,
+            pool_id,
             TwapUpdatedEvent {
                 timestamp: now,
                 odds,
@@ -4157,13 +4921,10 @@ impl PredinexContract {
             POOL_BUMP_TARGET,
         );
 
-        env.events().publish(
-            (
-                Symbol::new(&env, "bet_cancelled"),
-                event_version(&env),
-                pool_id,
-                user.clone(),
-            ),
+        emit_bet_cancelled(
+            &env,
+            pool_id,
+            user.clone(),
             BetCancelledEvent {
                 user,
                 pool_id,
@@ -4275,12 +5036,9 @@ impl PredinexContract {
             POOL_BUMP_TARGET,
         );
 
-        env.events().publish(
-            (
-                Symbol::new(&env, "cancel_pool"),
-                event_version(&env),
-                pool_id,
-            ),
+        emit_cancel_pool(
+            &env,
+            pool_id,
             PoolCancelledEvent {
                 cancelled_by: caller,
                 reason,
@@ -4392,12 +5150,9 @@ impl PredinexContract {
             POOL_BUMP_TARGET,
         );
 
-        env.events().publish(
-            (
-                Symbol::new(&env, "pool_duration_extended"),
-                event_version(&env),
-                pool_id,
-            ),
+        emit_pool_duration_extended(
+            &env,
+            pool_id,
             PoolDurationExtendedEvent {
                 creator,
                 new_expiry,
@@ -4430,14 +5185,7 @@ impl PredinexContract {
             .persistent()
             .set(&DataKey::DelegatedSettler(pool_id), &settler);
 
-        env.events().publish(
-            (
-                Symbol::new(&env, "assign_settler"),
-                event_version(&env),
-                pool_id,
-            ),
-            (creator, settler),
-        );
+        emit_assign_settler(&env, pool_id, creator, settler);
         Ok(())
     }
 
@@ -4473,13 +5221,7 @@ impl PredinexContract {
             .persistent()
             .set(&DataKey::MinSettlementParticipants, &min_participants);
 
-        env.events().publish(
-            (
-                Symbol::new(&env, "min_settlement_participants_set"),
-                event_version(&env),
-            ),
-            (old_min, min_participants),
-        );
+        emit_min_settlement_participants_set(&env, old_min, min_participants);
         Ok(())
     }
 
@@ -4613,8 +5355,9 @@ impl PredinexContract {
         );
 
         // #176 — emit enriched settlement event including source metadata.
-        env.events().publish(
-            (Symbol::new(env, "settle_pool"), event_version(env), pool_id),
+        emit_settle_pool(
+            env,
+            pool_id,
             SettlePoolEvent {
                 caller: caller.clone(),
                 winning_outcome,
@@ -4736,10 +5479,7 @@ impl PredinexContract {
             POOL_BUMP_TARGET,
         );
 
-        env.events().publish(
-            (Symbol::new(&env, "void_pool"), event_version(&env), pool_id),
-            caller,
-        );
+        emit_void_pool(&env, pool_id, caller);
         Ok(())
     }
 
@@ -4800,15 +5540,7 @@ impl PredinexContract {
         // #705 — Reduce user exposure when refund is claimed.
         Self::reduce_user_exposure(&env, &user, pool_id, refund);
 
-        env.events().publish(
-            (
-                Symbol::new(&env, "claim_refund"),
-                event_version(&env),
-                pool_id,
-                user.clone(),
-            ),
-            refund,
-        );
+        emit_claim_refund(&env, pool_id, user.clone(), refund);
 
         // Record refund in user claim history for analytics.
         let history_key = DataKey::UserClaimHistory(user.clone());
@@ -4945,15 +5677,7 @@ impl PredinexContract {
             .persistent()
             .extend_ttl(&history_key, POOL_BUMP_THRESHOLD, POOL_BUMP_TARGET);
 
-        env.events().publish(
-            (
-                Symbol::new(&env, "claim_expired"),
-                event_version(&env),
-                pool_id,
-                user,
-            ),
-            refund,
-        );
+        emit_claim_expired(&env, pool_id, user, refund);
 
         Ok(refund)
     }
@@ -5037,14 +5761,7 @@ impl PredinexContract {
             }
         }
 
-        env.events().publish(
-            (
-                Symbol::new(&env, "refund_expired_pool"),
-                event_version(&env),
-                pool_id,
-            ),
-            PoolRefundedEvent { total_refunded },
-        );
+        emit_refund_expired_pool(&env, pool_id, PoolRefundedEvent { total_refunded });
 
         Ok(())
     }
@@ -5268,13 +5985,10 @@ impl PredinexContract {
 
         // Step 4: emit events in final committed state.
         let analytics_user = user.clone();
-        env.events().publish(
-            (
-                Symbol::new(env, "claim_winnings"),
-                event_version(env),
-                pool_id,
-                user,
-            ),
+        emit_claim_winnings(
+            env,
+            pool_id,
+            user,
             ClaimEvent {
                 amount: winnings,
                 fee_amount: fee,
@@ -5394,15 +6108,7 @@ impl PredinexContract {
         env.storage()
             .persistent()
             .set(&DataKey::ScheduledClaimCounter, &(id + 1));
-        env.events().publish(
-            (
-                Symbol::new(&env, "claim_scheduled"),
-                event_version(&env),
-                pool_id,
-                user.clone(),
-            ),
-            (id, claim_at),
-        );
+        emit_claim_scheduled(&env, pool_id, user.clone(), id, claim_at);
         // Record a pending history entry so frontends/off-chain bots can
         // distinguish scheduled claims from completed payouts.
         let history_key = DataKey::UserClaimHistory(user.clone());
@@ -5471,15 +6177,7 @@ impl PredinexContract {
                 entry.pool_id,
                 entry.user.clone(),
             ));
-        env.events().publish(
-            (
-                Symbol::new(&env, "scheduled_claim_cancelled"),
-                event_version(&env),
-                entry.pool_id,
-                entry.user,
-            ),
-            scheduled_claim_id,
-        );
+        emit_scheduled_claim_cancelled(&env, entry.pool_id, entry.user, scheduled_claim_id);
         Ok(())
     }
 
@@ -5532,14 +6230,12 @@ impl PredinexContract {
                                         entry.user.clone(),
                                     ),
                                 );
-                                env.events().publish(
-                                    (
-                                        Symbol::new(&env, "scheduled_claim_executed"),
-                                        event_version(&env),
-                                        entry.pool_id,
-                                        entry.user,
-                                    ),
-                                    (id, amount),
+                                emit_scheduled_claim_executed(
+                                    &env,
+                                    entry.pool_id,
+                                    entry.user,
+                                    id,
+                                    amount,
                                 );
                                 results.push_back(ClaimAllEntry {
                                     pool_id: entry.pool_id,
@@ -5865,13 +6561,7 @@ impl PredinexContract {
         env.storage()
             .persistent()
             .remove(&DataKey::TreasuryWithdrawalState);
-        env.events().publish(
-            (
-                Symbol::new(&env, "treasury_withdraw_limit_set"),
-                event_version(&env),
-            ),
-            (max_withdrawal_per_window, withdrawal_window_secs),
-        );
+        emit_treasury_withdraw_limit_set(&env, max_withdrawal_per_window, withdrawal_window_secs);
         Ok(())
     }
 
@@ -5915,13 +6605,7 @@ impl PredinexContract {
             .persistent()
             .set(&DataKey::TreasuryRecipient, &new_recipient);
 
-        env.events().publish(
-            (
-                Symbol::new(&env, "treasury_recipient_rotated"),
-                event_version(&env),
-            ),
-            (current_recipient, new_recipient),
-        );
+        emit_treasury_recipient_rotated(&env, current_recipient, new_recipient);
         Ok(())
     }
 
@@ -5998,10 +6682,7 @@ impl PredinexContract {
             .persistent()
             .set(&DataKey::Treasury, &(current_treasury - amount));
 
-        env.events().publish(
-            (Symbol::new(&env, "treasury_withdrawn"), event_version(&env)),
-            (caller.clone(), treasury_recipient, amount),
-        );
+        emit_treasury_withdrawn(&env, caller.clone(), treasury_recipient, amount);
         Ok(())
     }
 
@@ -6020,10 +6701,7 @@ impl PredinexContract {
             .persistent()
             .set(&DataKey::FreezeAdmin, &freeze_admin);
 
-        env.events().publish(
-            (Symbol::new(&env, "freeze_admin_set"), event_version(&env)),
-            (old_freeze_admin, freeze_admin),
-        );
+        emit_freeze_admin_set(&env, old_freeze_admin, freeze_admin);
         Ok(())
     }
 
@@ -6040,10 +6718,7 @@ impl PredinexContract {
         let old_admin: Option<Address> = env.storage().persistent().get(&DataKey::Admin);
         env.storage().persistent().set(&DataKey::Admin, &admin);
 
-        env.events().publish(
-            (Symbol::new(&env, "admin_set"), event_version(&env)),
-            (old_admin, admin),
-        );
+        emit_admin_set(&env, old_admin, admin);
         Ok(())
     }
 
@@ -6086,14 +6761,7 @@ impl PredinexContract {
             POOL_BUMP_TARGET,
         );
 
-        env.events().publish(
-            (
-                Symbol::new(&env, "pool_frozen"),
-                event_version(&env),
-                pool_id,
-            ),
-            caller,
-        );
+        emit_pool_frozen(&env, pool_id, caller);
         Ok(())
     }
 
@@ -6114,10 +6782,7 @@ impl PredinexContract {
         env.storage()
             .persistent()
             .set(&DataKey::DisputeWindow, &window_secs);
-        env.events().publish(
-            (Symbol::new(&env, "dispute_window_set"), event_version(&env)),
-            window_secs,
-        );
+        emit_dispute_window_set(&env, window_secs);
         Ok(())
     }
 
@@ -6177,14 +6842,7 @@ impl PredinexContract {
             POOL_BUMP_TARGET,
         );
 
-        env.events().publish(
-            (
-                Symbol::new(&env, "pool_disputed"),
-                event_version(&env),
-                pool_id,
-            ),
-            caller,
-        );
+        emit_pool_disputed(&env, pool_id, caller);
         Ok(())
     }
 
@@ -6230,14 +6888,7 @@ impl PredinexContract {
             POOL_BUMP_TARGET,
         );
 
-        env.events().publish(
-            (
-                Symbol::new(&env, "pool_unfrozen"),
-                event_version(&env),
-                pool_id,
-            ),
-            caller,
-        );
+        emit_pool_unfrozen(&env, pool_id, caller);
         Ok(())
     }
 
@@ -6270,14 +6921,7 @@ impl PredinexContract {
             .persistent()
             .remove(&DataKey::PoolCoolingUntil(pool_id));
 
-        env.events().publish(
-            (
-                Symbol::new(&env, "pool_cooling_overridden"),
-                event_version(&env),
-                pool_id,
-            ),
-            caller,
-        );
+        emit_pool_cooling_overridden(&env, pool_id, caller);
         Ok(())
     }
 
@@ -6398,11 +7042,10 @@ impl PredinexContract {
         let end_index = core::cmp::min(start_index + effective_limit, all_entries.len());
         for i in start_index..end_index {
             let mut entry = all_entries.get(i).unwrap();
-            entry.winnings_claimed =
-                match Self::get_claim_status(env.clone(), pool_id, entry.user.clone()) {
-                    ClaimStatus::AlreadyClaimed => true,
-                    _ => false,
-                };
+            entry.winnings_claimed = matches!(
+                Self::get_claim_status(env.clone(), pool_id, entry.user.clone()),
+                ClaimStatus::AlreadyClaimed
+            );
             limited.push_back(entry);
         }
         limited
@@ -6608,27 +7251,13 @@ impl PredinexContract {
                 env.storage()
                     .persistent()
                     .set(&DataKey::PoolMetadata(pool_id), &uri);
-                env.events().publish(
-                    (
-                        Symbol::new(&env, "pool_metadata_set"),
-                        event_version(&env),
-                        pool_id,
-                    ),
-                    uri,
-                );
+                emit_pool_metadata_set(&env, pool_id, uri);
             }
             None => {
                 env.storage()
                     .persistent()
                     .remove(&DataKey::PoolMetadata(pool_id));
-                env.events().publish(
-                    (
-                        Symbol::new(&env, "pool_metadata_cleared"),
-                        event_version(&env),
-                        pool_id,
-                    ),
-                    creator,
-                );
+                emit_pool_metadata_cleared(&env, pool_id, creator);
             }
         }
         Ok(())
@@ -6687,14 +7316,7 @@ impl PredinexContract {
             POOL_BUMP_THRESHOLD,
             POOL_BUMP_TARGET,
         );
-        env.events().publish(
-            (
-                Symbol::new(&env, "pool_ext_metadata_set"),
-                event_version(&env),
-                pool_id,
-            ),
-            creator,
-        );
+        emit_pool_ext_metadata_set(&env, pool_id, creator);
         Ok(())
     }
 
@@ -6820,14 +7442,7 @@ impl PredinexContract {
         env.storage()
             .persistent()
             .set(&DataKey::PoolTemplateCounter, &(template_id + 1));
-        env.events().publish(
-            (
-                Symbol::new(&env, "pool_template_created"),
-                event_version(&env),
-                template_id,
-            ),
-            template.title,
-        );
+        emit_pool_template_created(&env, template_id, template.title);
         Ok(template_id)
     }
 
@@ -6901,14 +7516,7 @@ impl PredinexContract {
         env.storage()
             .persistent()
             .set(&DataKey::PoolTemplate(template_id), &saved);
-        env.events().publish(
-            (
-                Symbol::new(&env, "pool_template_updated"),
-                event_version(&env),
-                template_id,
-            ),
-            saved.title,
-        );
+        emit_pool_template_updated(&env, template_id, saved.title);
         Ok(())
     }
 
@@ -6953,14 +7561,7 @@ impl PredinexContract {
         env.storage()
             .persistent()
             .remove(&DataKey::PoolTemplate(template_id));
-        env.events().publish(
-            (
-                Symbol::new(&env, "pool_template_deleted"),
-                event_version(&env),
-                template_id,
-            ),
-            (),
-        );
+        emit_pool_template_deleted(&env, template_id);
         Ok(())
     }
 
@@ -7076,15 +7677,7 @@ impl PredinexContract {
             .persistent()
             .extend_ttl(&usage_key, POOL_BUMP_THRESHOLD, POOL_BUMP_TARGET);
 
-        env.events().publish(
-            (
-                Symbol::new(&env, "pool_created_from_template"),
-                event_version(&env),
-                template_id,
-                pool_id,
-            ),
-            (),
-        );
+        emit_pool_created_from_template(&env, template_id, pool_id);
         Ok(pool_id)
     }
 
@@ -7132,7 +7725,9 @@ impl PredinexContract {
             }
             let key = DataKey::UserBet(pool_id, user.clone());
             if let Some(bet) = env.storage().persistent().get::<_, UserBet>(&key) {
-                // #1053 — Extend TTL on read to keep entry alive.
+                // #1053 — Only extend TTL if remaining lifetime is below threshold.
+                // This avoids metered write amplification from dashboard polling; reads
+                // now trigger writes only when the entry is approaching expiration.
                 env.storage()
                     .persistent()
                     .extend_ttl(&key, POOL_BUMP_THRESHOLD, POOL_BUMP_TARGET);
@@ -7360,13 +7955,11 @@ impl PredinexContract {
         Self::require_treasury_recipient(&env, &caller)?;
         env.storage().persistent().set(&DataKey::Paused, &paused);
 
-        let event_name = if paused {
-            Symbol::new(&env, "contract_paused")
+        if paused {
+            emit_contract_paused(&env, caller);
         } else {
-            Symbol::new(&env, "contract_unpaused")
-        };
-        env.events()
-            .publish((event_name, event_version(&env)), caller);
+            emit_contract_unpaused(&env, caller);
+        }
         Ok(())
     }
 
@@ -7374,14 +7967,22 @@ impl PredinexContract {
     /// Only the treasury recipient (admin) may call this.
     /// Emits a `contract_paused` event.
     pub fn pause_contract(env: Env, caller: Address) -> Result<(), ContractError> {
-        Self::set_paused(env, caller, true)
+        caller.require_auth();
+        Self::require_treasury_recipient(&env, &caller)?;
+        env.storage().persistent().set(&DataKey::Paused, &true);
+        emit_pool_paused(&env, caller);
+        Ok(())
     }
 
     /// #456 — Unpause the contract. Convenience wrapper around [`set_paused`](Self::set_paused).
     /// Only the treasury recipient (admin) may call this.
     /// Emits a `contract_unpaused` event.
     pub fn unpause_contract(env: Env, caller: Address) -> Result<(), ContractError> {
-        Self::set_paused(env, caller, false)
+        caller.require_auth();
+        Self::require_treasury_recipient(&env, &caller)?;
+        env.storage().persistent().set(&DataKey::Paused, &false);
+        emit_pool_unpaused(&env, caller);
+        Ok(())
     }
 
     /// Return whether the contract is currently paused.
@@ -7616,10 +8217,7 @@ impl PredinexContract {
             .get(&DataKey::ReferralBps)
             .unwrap_or(0);
         env.storage().persistent().set(&DataKey::ReferralBps, &bps);
-        env.events().publish(
-            (Symbol::new(&env, "referral_bps_set"), event_version(&env)),
-            (caller, old_bps, bps),
-        );
+        emit_referral_bps_set(&env, caller, old_bps, bps);
         Ok(())
     }
 
@@ -7707,11 +8305,8 @@ impl PredinexContract {
 
         env.storage().persistent().remove(&key);
 
-        env.events().publish(
-            (
-                Symbol::new(&env, "referral_reward_claimed"),
-                event_version(&env),
-            ),
+        emit_referral_reward_claimed(
+            &env,
             ReferralRewardClaimedEvent {
                 referrer,
                 amount: balance,
@@ -7775,7 +8370,7 @@ impl PredinexContract {
         // Ensure the URL contains valid ASCII/UTF-8 hostname characters after scheme.
         // Reject control characters and non-printable bytes.
         for &byte in after_scheme.iter().take(after_scheme.len().min(64)) {
-            if byte < 0x20 || byte > 0x7E {
+            if !(0x20..=0x7E).contains(&byte) {
                 return Err(ContractError::InvalidWebhookUrl);
             }
         }
@@ -7825,10 +8420,7 @@ impl PredinexContract {
             POOL_BUMP_TARGET,
         );
 
-        env.events().publish(
-            (Symbol::new(&env, "webhook_registered"), event_version(&env)),
-            (url, event_types.len()),
-        );
+        emit_webhook_registered(&env, url, event_types.len());
         Ok(())
     }
 
@@ -7872,13 +8464,7 @@ impl PredinexContract {
             );
         }
 
-        env.events().publish(
-            (
-                Symbol::new(&env, "webhook_unregistered"),
-                event_version(&env),
-            ),
-            url,
-        );
+        emit_webhook_unregistered(&env, url);
         Ok(())
     }
 
@@ -7918,9 +8504,9 @@ impl PredinexContract {
         // #1051 — Clamp rate_bps to a sane range (1_000 to 1_000_000) to prevent
         // accidental or malicious extreme rate changes that would break multi-asset
         // bet normalization and payouts.
-        const MIN_RATE_BPS: i128 = 1_000;      // 0.1x (10%)
-        const MAX_RATE_BPS: i128 = 1_000_000;  // 100x (10,000%)
-        if rate_bps < MIN_RATE_BPS || rate_bps > MAX_RATE_BPS {
+        const MIN_RATE_BPS: i128 = 1_000; // 0.1x (10%)
+        const MAX_RATE_BPS: i128 = 1_000_000; // 100x (10,000%)
+        if !(MIN_RATE_BPS..=MAX_RATE_BPS).contains(&rate_bps) {
             return Err(ContractError::FeeOutOfBounds);
         }
 
@@ -7932,10 +8518,7 @@ impl PredinexContract {
             .persistent()
             .set(&DataKey::TokenExchangeRate(token.clone()), &rate_bps);
 
-        env.events().publish(
-            (Symbol::new(&env, "token_rate_set"), event_version(&env)),
-            (token, old_rate, rate_bps),
-        );
+        emit_token_rate_set(&env, token, old_rate, rate_bps);
         Ok(())
     }
 
@@ -8074,14 +8657,7 @@ impl PredinexContract {
                 .persistent()
                 .set(&DataKey::PoolTokenMaxBet(pool_id, token.clone()), &max_bet);
         }
-        env.events().publish(
-            (
-                Symbol::new(&env, "pool_token_bet_limits_set"),
-                event_version(&env),
-                pool_id,
-            ),
-            (token, old_min, old_max, min_bet, max_bet),
-        );
+        emit_pool_token_bet_limits_set(&env, pool_id, token, old_min, old_max, min_bet, max_bet);
         Ok(())
     }
 
@@ -8459,13 +9035,10 @@ impl PredinexContract {
             .persistent()
             .set(&DataKey::TotalContractVolume, &total_contract_volume);
 
-        env.events().publish(
-            (
-                Symbol::new(&env, "place_bet"),
-                event_version(&env),
-                pool_id,
-                user.clone(),
-            ),
+        emit_place_bet(
+            &env,
+            pool_id,
+            user.clone(),
             BetEvent {
                 outcome,
                 amount: normalized,
@@ -8479,12 +9052,9 @@ impl PredinexContract {
             if *ref_addr == user {
                 return Err(ContractError::SelfReferral);
             }
-            env.events().publish(
-                (
-                    Symbol::new(&env, "referral_bet"),
-                    event_version(&env),
-                    pool_id,
-                ),
+            emit_referral_bet(
+                &env,
+                pool_id,
                 ReferralBetEvent {
                     referrer: ref_addr.clone(),
                     pool_id,
@@ -8558,14 +9128,7 @@ impl PredinexContract {
                 POOL_BUMP_THRESHOLD,
                 POOL_BUMP_TARGET,
             );
-            env.events().publish(
-                (
-                    Symbol::new(&env, "pool_cooling_started"),
-                    event_version(&env),
-                    pool_id,
-                ),
-                (cooling_until, new_total),
-            );
+            emit_pool_cooling_started(&env, pool_id, cooling_until, new_total);
         }
         Ok(())
     }
@@ -8775,14 +9338,16 @@ impl PredinexContract {
             .remove(&DataKey::UserOutcomeBets(pool_id, user.clone()));
 
         let analytics_user = user.clone();
-        env.events().publish(
-            (
-                Symbol::new(&env, "claim_winnings"),
-                event_version(&env),
-                pool_id,
-                user,
-            ),
-            total_norm_paid,
+        emit_claim_winnings(
+            &env,
+            pool_id,
+            user,
+            ClaimEvent {
+                amount: total_norm_paid,
+                fee_amount: 0,
+                winning_outcome,
+                total_pool_size: 0,
+            },
         );
 
         let total_key = DataKey::UserTotalClaimed(analytics_user.clone());
@@ -8883,10 +9448,7 @@ impl PredinexContract {
 
         token::Client::new(&env, &token).transfer(&env.current_contract_address(), &to, &amount);
 
-        env.events().publish(
-            (Symbol::new(&env, "tokens_rescued"), event_version(&env)),
-            (token, to, amount),
-        );
+        emit_tokens_rescued(&env, token, to, amount);
 
         Ok(())
     }
@@ -9007,10 +9569,7 @@ impl PredinexContract {
         env.storage()
             .persistent()
             .set(&DataKey::BridgeTimeout, &timeout_secs);
-        env.events().publish(
-            (Symbol::new(&env, "bridge_timeout_set"), event_version(&env)),
-            timeout_secs,
-        );
+        emit_bridge_timeout_set(&env, timeout_secs);
         Ok(())
     }
 
@@ -9024,13 +9583,7 @@ impl PredinexContract {
         env.storage()
             .persistent()
             .set(&DataKey::CrossChainDisputeWindow, &window_secs);
-        env.events().publish(
-            (
-                Symbol::new(&env, "cross_chain_dispute_window_set"),
-                event_version(&env),
-            ),
-            window_secs,
-        );
+        emit_cross_chain_dispute_window_set(&env, window_secs);
         Ok(())
     }
 
@@ -9091,12 +9644,9 @@ impl PredinexContract {
             POOL_BUMP_THRESHOLD,
             POOL_BUMP_TARGET,
         );
-        env.events().publish(
-            (
-                Symbol::new(&env, "mirror_created"),
-                event_version(&env),
-                source_pool_id,
-            ),
+        emit_mirror_created(
+            &env,
+            source_pool_id,
             MirrorCreatedEvent {
                 source_pool_id,
                 unified_pool_id: unified_id,
@@ -9123,7 +9673,7 @@ impl PredinexContract {
         if mirror.is_settled {
             return Err(ContractError::PoolAlreadySettled);
         }
-        
+
         // #1052 — Validate winning_outcome is within the source pool's outcome set bounds.
         // Fetch the source pool to check its outcome count.
         let source_pool: Pool = env
@@ -9131,14 +9681,14 @@ impl PredinexContract {
             .persistent()
             .get(&DataKey::Pool(source_pool_id))
             .ok_or(ContractError::PoolNotFound)?;
-        
+
         // Reject any outcome index >= num_outcomes to prevent settling to an
         // out-of-bounds outcome that would break payout calculations.
         let outcome_count = Self::read_outcome_totals(&env, source_pool_id, &source_pool).len();
         if winning_outcome >= outcome_count {
             return Err(ContractError::InvalidOutcome);
         }
-        
+
         let timeout: u64 = env
             .storage()
             .persistent()
@@ -9156,12 +9706,9 @@ impl PredinexContract {
         env.storage()
             .persistent()
             .set(&DataKey::MirrorByUnifiedId(mirror.unified_pool_id), &mirror);
-        env.events().publish(
-            (
-                Symbol::new(&env, "cross_chain_settled"),
-                event_version(&env),
-                mirror.unified_pool_id,
-            ),
+        emit_cross_chain_settled(
+            &env,
+            mirror.unified_pool_id,
             CrossChainSettlementEvent {
                 unified_pool_id: mirror.unified_pool_id,
                 winning_outcome,
@@ -9212,13 +9759,7 @@ impl PredinexContract {
         env.storage()
             .persistent()
             .set(&DataKey::LpFeeAllocationBps, &fee_allocation_bps);
-        env.events().publish(
-            (
-                Symbol::new(&env, "lp_fee_allocation_set"),
-                event_version(&env),
-            ),
-            fee_allocation_bps,
-        );
+        emit_lp_fee_allocation_set(&env, fee_allocation_bps);
         Ok(())
     }
 
@@ -9235,10 +9776,7 @@ impl PredinexContract {
         env.storage()
             .persistent()
             .set(&DataKey::LpStakeBoostBps, &boost_bps);
-        env.events().publish(
-            (Symbol::new(&env, "lp_stake_boost_set"), event_version(&env)),
-            boost_bps,
-        );
+        emit_lp_stake_boost_set(&env, boost_bps);
         Ok(())
     }
 
@@ -9417,13 +9955,10 @@ impl PredinexContract {
             POOL_BUMP_TARGET,
         );
 
-        env.events().publish(
-            (
-                Symbol::new(&env, "lp_deposit"),
-                event_version(&env),
-                pool_id,
-                user.clone(),
-            ),
+        emit_lp_deposit(
+            &env,
+            pool_id,
+            user.clone(),
             LpDepositEvent {
                 user: user.clone(),
                 pool_id,
@@ -9570,13 +10105,10 @@ impl PredinexContract {
             &withdraw_amount,
         );
 
-        env.events().publish(
-            (
-                Symbol::new(&env, "lp_withdraw"),
-                event_version(&env),
-                pool_id,
-                user.clone(),
-            ),
+        emit_lp_withdraw(
+            &env,
+            pool_id,
+            user.clone(),
             LpWithdrawEvent {
                 user: user.clone(),
                 pool_id,
@@ -9657,13 +10189,10 @@ impl PredinexContract {
             POOL_BUMP_TARGET,
         );
 
-        env.events().publish(
-            (
-                Symbol::new(&env, "lp_reward_claimed"),
-                event_version(&env),
-                pool_id,
-                user.clone(),
-            ),
+        emit_lp_reward_claimed(
+            &env,
+            pool_id,
+            user.clone(),
             LpRewardClaimEvent {
                 user,
                 pool_id,
@@ -9723,15 +10252,7 @@ impl PredinexContract {
             POOL_BUMP_THRESHOLD,
             POOL_BUMP_TARGET,
         );
-        env.events().publish(
-            (
-                Symbol::new(&env, "lp_staked"),
-                event_version(&env),
-                pool_id,
-                user,
-            ),
-            (new_staked, lock_until),
-        );
+        emit_lp_staked(&env, pool_id, user, new_staked, lock_until);
         Ok(())
     }
 
@@ -9749,22 +10270,14 @@ impl PredinexContract {
         env.storage()
             .persistent()
             .remove(&DataKey::LpStake(pool_id, user.clone()));
-        env.events().publish(
-            (
-                Symbol::new(&env, "lp_unstaked"),
-                event_version(&env),
-                pool_id,
-                user,
-            ),
-            released,
-        );
+        emit_lp_unstaked(&env, pool_id, user, released);
         Ok(released)
     }
 
     pub fn get_lp_position(env: Env, pool_id: u32, user: Address) -> LpPosition {
         env.storage()
             .persistent()
-            .get(&DataKey::LpPosition(pool_id, user))
+            .get(&DataKey::LpPosition(pool_id, user.clone()))
             .unwrap_or(LpPosition {
                 shares: 0,
                 reward_debt: 0,
@@ -9772,6 +10285,7 @@ impl PredinexContract {
     }
 
     pub fn get_pending_lp_rewards(env: Env, pool_id: u32, user: Address) -> i128 {
+        // `user` is needed again below to compute the pending amount.
         let position: LpPosition = env
             .storage()
             .persistent()
@@ -9915,14 +10429,7 @@ impl PredinexContract {
             POOL_BUMP_THRESHOLD,
             POOL_BUMP_TARGET,
         );
-        env.events().publish(
-            (
-                Symbol::new(&env, "lp_rewards_distributed"),
-                event_version(&env),
-                pool_id,
-            ),
-            amount,
-        );
+        emit_lp_rewards_distributed(&env, pool_id, amount);
         Ok(())
     }
 }
