@@ -156,6 +156,81 @@ stellar contract build
 
 ---
 
+
+## Local Operation
+
+This section covers how to operate the stack locally for development and testing.
+
+### 1. Running the Settlement Bot
+
+The settlement bot (`bot/`) requires the following environment variables to run against testnet:
+
+```bash
+cd bot
+cp .env.example .env
+```
+
+Edit `.env` with:
+
+```env
+STELLAR_RPC_URL=https://soroban-testnet.stellar.org
+STELLAR_NETWORK=testnet
+CONTRACT_ID=<testnet-contract-id>
+BOT_SECRET_KEY=<your-secret-key> # Must be contract admin
+AUTO_SETTLE_ENABLED=true
+```
+
+Then run the bot:
+
+```bash
+npm install
+npm start
+```
+
+### 2. Pointing Web App to Local/Testnet RPC
+
+To configure the web frontend (`web/`) to use a local or testnet RPC, update your `web/.env.local` file:
+
+```env
+# For Testnet
+NEXT_PUBLIC_SOROBAN_RPC_URL=https://soroban-testnet.stellar.org
+NEXT_PUBLIC_NETWORK=testnet
+NEXT_PUBLIC_SOROBAN_CONTRACT_ID=<testnet-contract-id>
+
+# For Local RPC (e.g. stellar quickstart)
+NEXT_PUBLIC_SOROBAN_RPC_URL=http://localhost:8000/soroban/rpc
+NEXT_PUBLIC_NETWORK=standalone
+NEXT_PUBLIC_SOROBAN_CONTRACT_ID=<local-contract-id>
+```
+
+### 3. Regenerating Contract Snapshots
+
+When you modify the contract API or events, the stored JSON snapshots in `contracts/predinex/test_snapshots/` will cause noise and test failures. To deliberately regenerate them:
+
+```bash
+cd contracts/predinex
+# Remove the outdated snapshots
+rm -rf test_snapshots/
+# Run tests to generate new snapshots (tests will write fresh .json files)
+UPDATE_EXPECT=1 cargo test
+```
+*Review the `git diff` of the new snapshots carefully before committing.*
+
+### 4. Pre-PR Checks (WASM & Benchmarks)
+
+Before opening a pull request with contract changes, always run the WASM size measurement and concurrency scripts to ensure you haven't introduced size or performance regressions:
+
+```bash
+# Measure WASM size (ensure it stays under limits)
+./scripts/measure-contract-wasm-size.sh
+
+# Run concurrency and benchmark tests
+./scripts/concurrency-test.sh
+cd contracts/predinex && cargo bench
+```
+
+---
+
 ## Common Setup Issues & Solutions
 
 ### Issue: WASM Target Missing
